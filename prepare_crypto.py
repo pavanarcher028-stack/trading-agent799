@@ -1,6 +1,6 @@
 """
 Prepare crypto market data for autoresearch.
-Downloads BTC/USDT hourly OHLCV, quantizes price changes into tokens.
+Downloads BTC, ETH, SOL, XRP hourly data, quantizes price changes into tokens.
 """
 
 import os
@@ -12,7 +12,6 @@ import pyarrow.parquet as pq
 import pyarrow as pa
 import torch
 import yfinance as yf
-from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -20,110 +19,122 @@ from datetime import datetime, timedelta
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-MAX_SEQ_LEN = 256       # shorter context for price sequences
+MAX_SEQ_LEN = 256
 TIME_BUDGET = 300
 EVAL_TOKENS = 40 * 65536
 
-# Number of price change bins (vocab size)
-NUM_BINS = 64  # 32 up + 32 down
-VOCAB_SIZE = NUM_BINS + 1  # +1 for padding/separator
+NUM_BINS = 64
+VOCAB_SIZE = NUM_BINS + 1
+
+COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
+COIN_NAMES = {s: s.split("-")[0] for s in COINS}
 
 # ---------------------------------------------------------------------------
-# Step 1: Download BTC data
+# Step 1: Download data for all coins
 # ---------------------------------------------------------------------------
 
-def download_btc_data():
-    """Download hourly BTC/USDT data from Binance via yfinance."""
+def download_all():
     os.makedirs(DATA_DIR, exist_ok=True)
-    parquet_path = os.path.join(DATA_DIR, "btc_hourly.parquet")
-
-    if os.path.exists(parquet_path):
-        print(f"BTC data already exists at {parquet_path}")
-        return
-
-    print("Downloading BTC/USDT hourly data...")
-    btc = yf.download("BTC-USD", interval="1h", period="max", progress=False)
-    btc.columns = [c[0].lower() for c in btc.columns]
-    btc.to_parquet(parquet_path)
-    print(f"Downloaded {len(btc)} hourly bars -> {parquet_path}")
+    for symbol in COINS:
+        path = os.path.join(DATA_DIR, f"{COIN_NAMES[symbol]}_hourly.parquet")
+        if os.path.exists(path):
+            print(f"{COIN_NAMES[symbol]}: already exists")
+            continue
+        print(f"Downloading {symbol} hourly...")
+        df = yf.download(symbol, interval="1h", period="max", progress=False)
+        if hasattr(df.columns, "get_level_values"):
+            df.columns = [c[0].lower() for c in df.columns]
+        df.to_parquet(path)
+        print(f"  -> {len(df)} bars")
 
 # ---------------------------------------------------------------------------
-# Step 2: Quantize price changes into tokens
+# Step 2: Quantize price changes
 # ---------------------------------------------------------------------------
 
 def price_to_token(pct_change, num_bins=NUM_BINS):
-    """Map a percentage price change to a token ID."""
-    half = num_bins // 2
-    # Clip to reasonable range (±15% for hourly)
     clipped = np.clip(pct_change, -15, 15)
-    # Normalize to [0, num_bins-1]
     normalized = (clipped + 15) / 30 * (num_bins - 1)
     return int(round(normalized))
 
-def token_to_description(token_id, num_bins=NUM_BINS):
-    """Convert token ID back to a human-readable price change."""
-    half = num_bins // 2
-    normalized = token_id / (num_bins - 1)
-    pct = normalized * 30 - 15
-    return f"{pct:+.2f}%"
+def load_coin_tokens(symbol):
+    path = os.path.join(DATA_DIR, f"{COIN_NAMES[symbol]}_hourly.parquet")
+    df = pd.read_parquet(path)
+    prices = df["close"].values
+    log_returns = np.diff(np.log(prices)) * 100
+    tokens = np.array([price_to_token(r) for r in log_returns], dtype=np.int32)
+    return tokens
+
+# ---------------------------------------------------------------------------
+# Step 3: Build shards (interleaved across coins)
+# ---------------------------------------------------------------------------
+
+def make_shards(all_tokens, seq_len, shard_size_seqs=5000):
+    num_seqs = len(all_tokens) // seq_len
+    all_seqs = []
+    for j in range(num_seqs):
+        s = all_tokens[j * seq_len:(j + 1) * seq_len]
+        all_seqs.append(" ".join(str(t) for t in s))
+    num_shards = max(1, len(all_seqs) // shard_size_seqs)
+    shards = []
+    for i in range(num_shards):
+        start = i * shard_size_seqs
+        end = start + shard_size_seqs if i < num_shards - 1 else len(all_seqs)
+        shards.append(all_seqs[start:end])
+    return shards
 
 def prepare_sequences(seq_len=MAX_SEQ_LEN):
-    """Load BTC data, quantize, create sequences."""
-    parquet_path = os.path.join(DATA_DIR, "btc_hourly.parquet")
-    df = pd.read_parquet(parquet_path)
+    all_train = []
+    all_val = []
 
-    # Compute log returns
-    prices = df["close"].values
-    log_returns = np.diff(np.log(prices)) * 100  # percentage
-    tokens = np.array([price_to_token(r) for r in log_returns], dtype=np.int32)
+    for symbol in COINS:
+        tokens = load_coin_tokens(symbol)
+        split = int(len(tokens) * 0.9)
+        train_t, val_t = tokens[:split], tokens[split:]
+        all_train.append(train_t)
+        all_val.append(val_t)
+        print(f"{COIN_NAMES[symbol]}: {len(tokens):,} tokens (train: {len(train_t):,}, val: {len(val_t):,})")
 
-    # Split into train/val (90/10)
-    split = int(len(tokens) * 0.9)
-    train_tokens = tokens[:split]
-    val_tokens = tokens[split:]
+    # Interleave training tokens from all coins
+    max_train = max(len(t) for t in all_train)
+    interleaved_train = []
+    for i in range(max_train):
+        for ct in all_train:
+            if i < len(ct):
+                interleaved_train.append(ct[i])
+    interleaved_train = np.array(interleaved_train, dtype=np.int32)
+    print(f"Interleaved train tokens: {len(interleaved_train):,}")
 
-    print(f"Total tokens: {len(tokens):,} | Train: {len(train_tokens):,} | Val: {len(val_tokens):,}")
+    # Interleave val tokens
+    max_val = max(len(t) for t in all_val)
+    interleaved_val = []
+    for i in range(max_val):
+        for ct in all_val:
+            if i < len(ct):
+                interleaved_val.append(ct[i])
+    interleaved_val = np.array(interleaved_val, dtype=np.int32)
+    print(f"Interleaved val tokens: {len(interleaved_val):,}")
 
-    # Create sequences as space-separated token strings (to match autoresearch parquet format)
-    def create_shard(token_array, num_shards=5):
-        shard_size = len(token_array) // num_shards
-        shards = []
-        for i in range(num_shards):
-            start = i * shard_size
-            end = start + shard_size if i < num_shards - 1 else len(token_array)
-            # Create sequences of seq_len tokens as strings
-            seq_tokens = token_array[start:end]
-            num_seqs = len(seq_tokens) // seq_len
-            seqs = []
-            for j in range(num_seqs):
-                s = seq_tokens[j * seq_len:(j + 1) * seq_len]
-                seqs.append(" ".join(str(t) for t in s))
-            shards.append(seqs)
-        return shards
-
-    train_shards = create_shard(train_tokens)
-    val_shards = create_shard(val_tokens)
+    train_shards = make_shards(interleaved_train, seq_len)
+    val_shards = make_shards(interleaved_val, seq_len)
 
     # Save train shards
     for i, shard in enumerate(train_shards):
         tbl = pa.table({"text": pa.array(shard)})
         pq.write_table(tbl, os.path.join(DATA_DIR, f"train_shard_{i:05d}.parquet"))
 
-    # Save val shard
+    # Save val shards
     for i, shard in enumerate(val_shards):
         tbl = pa.table({"text": pa.array(shard)})
         pq.write_table(tbl, os.path.join(DATA_DIR, f"val_shard_{i:05d}.parquet"))
 
     print(f"Saved {len(train_shards)} train shards, {len(val_shards)} val shards")
-    return train_tokens, val_tokens
+    return interleaved_train, interleaved_val
 
 # ---------------------------------------------------------------------------
-# Step 3: Simple tokenizer (maps token IDs to themselves)
+# Tokenizer
 # ---------------------------------------------------------------------------
 
 class PriceTokenizer:
-    """Simple tokenizer for price movement tokens."""
-
     def __init__(self):
         self.vocab_size = VOCAB_SIZE
         self.bos_token_id = 0
@@ -159,13 +170,11 @@ class PriceTokenizer:
     def decode(self, ids):
         return " ".join(str(i) for i in ids)
 
+
 def save_tokenizer():
-    """Save a dummy tokenizer file to keep prepare.py imports happy."""
     os.makedirs(TOKENIZER_DIR, exist_ok=True)
-    # Save a pickle that matches the interface
     token_bytes = torch.ones(VOCAB_SIZE, dtype=torch.int32)
     torch.save(token_bytes, os.path.join(TOKENIZER_DIR, "token_bytes.pt"))
-    # Save tokenizer pickle
     with open(os.path.join(TOKENIZER_DIR, "tokenizer.pkl"), "wb") as f:
         pickle.dump(None, f)
     print(f"Tokenizer saved to {TOKENIZER_DIR}")
@@ -176,12 +185,13 @@ def save_tokenizer():
 
 if __name__ == "__main__":
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"Coins: {', '.join(COIN_NAMES[s] for s in COINS)}")
     print()
 
-    download_btc_data()
+    download_all()
     print()
 
-    train_tokens, val_tokens = prepare_sequences()
+    prepare_sequences()
     print()
 
     save_tokenizer()
