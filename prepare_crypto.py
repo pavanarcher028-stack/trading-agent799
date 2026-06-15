@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pyarrow as pa
 import torch
 import yfinance as yf
+import ccxt
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,15 +30,20 @@ VOCAB_SIZE = NUM_BINS + 1
 COINS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 COIN_NAMES = {s: s.split("-")[0] for s in COINS}
 
-# Timeframes: (label, yfinance_interval, period, resample_minutes)
+# Timeframes: (label, ccxt_timeframe, resample_minutes)
 TIMEFRAMES = [
-    ("5m",  "5m",  "2mo",  5),
-    ("10m", "5m",  "2mo",  10),   # resampled from 5m
-    ("30m", "30m", "2mo",  30),
-    ("1h",  "1h",  "max",  60),
-    ("4h",  "1h",  "max",  240),  # resampled from 1h
-    ("1d",  "1d",  "max",  1440),
+    ("5m",  "5m",  5),
+    ("10m", "5m",  10),   # resampled from 5m
+    ("30m", "30m", 30),
+    ("1h",  "1h",  60),
+    ("4h",  "1h",  240),  # resampled from 1h
+    ("1d",  "1d",  1440),
 ]
+
+# Which timeframes come directly from an exchange vs resampled
+RAW_TFS = {"5m", "30m", "1h", "1d"}
+RESAMPLED_TFS = {"10m", "4h"}
+RESAMPLE_SOURCE = {"10m": "5m", "4h": "1h"}
 
 # Clip range scales with timeframe (wider for longer TFs)
 TF_CLIP = {
@@ -45,42 +51,62 @@ TF_CLIP = {
     "1h": 10, "4h": 12, "1d": 20,
 }
 
+# Map coin name to ccxt symbol
+CCXT_SYMBOLS = {s: f"{COIN_NAMES[s]}/USDT" for s in COINS}
+
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 
+def fetch_ccxt_ohlcv(symbol_ccxt, timeframe, limit=1000):
+    """Fetch all available OHLCV from Binance via ccxt."""
+    exchange = ccxt.binance()
+    exchange.load_markets()
+    all_candles = []
+    since = None
+    while True:
+        candles = exchange.fetch_ohlcv(symbol_ccxt, timeframe, since=since, limit=limit)
+        if not candles:
+            break
+        all_candles.extend(candles)
+        since = candles[-1][0] + 1
+        if len(candles) < limit:
+            break
+    df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("timestamp", inplace=True)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+
 def download_symbol(symbol):
-    for label, interval, period, _ in TIMEFRAMES:
+    for label, tf, _ in TIMEFRAMES:
+        if label in RESAMPLED_TFS:
+            continue
         dirname = f"{COIN_NAMES[symbol]}_{label}"
         path = os.path.join(DATA_DIR, dirname, "data.parquet")
         if os.path.exists(path):
             print(f"  {label}: already exists")
             continue
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Only download raw intervals; 10m & 4h are resampled later
-        if label in ("10m", "4h"):
-            continue
-        print(f"  Downloading {symbol} {label} ({interval}, {period})...")
-        df = yf.download(symbol, interval=interval, period=period, progress=False)
-        if df.empty:
-            print(f"    no data")
-            continue
-        if hasattr(df.columns, "get_level_values"):
-            df.columns = [c[0].lower() for c in df.columns]
-        df.to_parquet(path)
-        print(f"    -> {len(df)} bars")
-
+        print(f"  Fetching {COIN_NAMES[symbol]} {label} from Binance...")
+        try:
+            df = fetch_ccxt_ohlcv(CCXT_SYMBOLS[symbol], tf)
+            if df.empty:
+                print(f"    no data")
+                continue
+            df.to_parquet(path)
+            print(f"    -> {len(df)} bars")
+        except Exception as e:
+            print(f"    failed: {e}")
 
 def resample_if_needed(symbol):
-    for label, _, _, resample_min in TIMEFRAMES:
-        if label not in ("10m", "4h"):
-            continue
+    resample_map = {"10m": ("5m", 10), "4h": ("1h", 240)}
+    for label, (src_label, resample_min) in resample_map.items():
         dirname = f"{COIN_NAMES[symbol]}_{label}"
         path = os.path.join(DATA_DIR, dirname, "data.parquet")
         if os.path.exists(path):
             continue
-        # Find source interval
-        src_label = "5m" if label == "10m" else "1h"
         src_dir = f"{COIN_NAMES[symbol]}_{src_label}"
         src_path = os.path.join(DATA_DIR, src_dir, "data.parquet")
         if not os.path.exists(src_path):
@@ -97,7 +123,7 @@ def resample_if_needed(symbol):
 
 
 def download_all():
-    print("=== Downloading data ===")
+    print("=== Downloading data from Binance (ccxt) ===")
     for symbol in COINS:
         print(f"\n{COIN_NAMES[symbol]}:")
         download_symbol(symbol)
